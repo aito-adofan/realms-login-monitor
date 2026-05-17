@@ -14,10 +14,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: '24'
 
@@ -53,17 +53,7 @@ jobs:
 
       - name: Ensure state.json exists
         run: |
-          if [ ! -f state.json ]; then
-            cat > state.json <<'JSON'
-            {
-              "previousCount": 0,
-              "authPaused": false,
-              "authFailedAt": null,
-              "authRecoveredAt": null,
-              "updatedAt": null
-            }
-            JSON
-          fi
+          node -e "const fs=require('fs'); const p='state.json'; if (!fs.existsSync(p)) { fs.writeFileSync(p, JSON.stringify({ previousCount: 0, authPaused: false, authFailedAt: null, authRecoveredAt: null, updatedAt: null }, null, 2) + '\n'); console.log('Created state.json'); } else { console.log('state.json already exists'); }"
 
       - name: Run monitor
         env:
