@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   monitor:
@@ -49,33 +49,19 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Ensure state.json exists
-        run: |
-          node -e "const fs=require('fs'); const p='state.json'; if (!fs.existsSync(p)) { fs.writeFileSync(p, JSON.stringify({ previousCount: 0, authPaused: false, authFailedAt: null, authRecoveredAt: null, updatedAt: null }, null, 2) + '\n'); console.log('Created state.json'); } else { console.log('state.json already exists'); }"
-
       - name: Run monitor
         env:
           REALM_ID: ${{ secrets.REALM_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_ADMIN_WEBHOOK_URL: ${{ secrets.DISCORD_ADMIN_WEBHOOK_URL }}
-          PRISMARINE_AUTH_CACHE_BUNDLE: ${{ secrets.PRISMARINE_AUTH_CACHE_BUNDLE }}
+
           GH_REPO: ${{ secrets.GH_REPO }}
+          GH_INTERNAL_AUTOMATION_TOKEN: ${{ secrets.GH_INTERNAL_AUTOMATION_TOKEN }}
+          GH_MONITOR_STATE_VARIABLE_NAME: ${{ secrets.GH_MONITOR_STATE_VARIABLE_NAME }}
+
           GH_SECRETS_WRITE_TOKEN: ${{ secrets.GH_SECRETS_WRITE_TOKEN }}
           GH_AUTH_CACHE_SECRET_NAME: ${{ secrets.GH_AUTH_CACHE_SECRET_NAME }}
+
           MONITOR_TIMEOUT_MS: 15000
           RECOVERY_TIMEOUT_MS: 300000
         run: node index.js
-
-      - name: Commit updated state.json
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add state.json
-
-          if git diff --cached --quiet; then
-            echo "No state.json changes to commit."
-          else
-            git commit -m "Update state.json"
-            git push
-          fi
