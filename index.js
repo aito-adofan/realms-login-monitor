@@ -11,6 +11,7 @@ const AUTH_CACHE_DIR = path.join(__dirname, 'auth-cache')
 const DEFAULT_MONITOR_TIMEOUT_MS = 15_000
 const DEFAULT_RECOVERY_TIMEOUT_MS = 300_000
 const DEFAULT_STATE_VARIABLE_NAME = 'MONITOR_STATE'
+const DEFAULT_AUTH_CACHE_SECRET_NAME = 'PRISMARINE_AUTH_CACHE_BUNDLE'
 
 class AuthNeedsRefreshError extends Error {
   constructor(message = 'auth-cache の再生成が必要です。', details = {}) {
@@ -23,7 +24,7 @@ class AuthNeedsRefreshError extends Error {
 function requiredEnv(name) {
   const value = process.env[name]
   if (!value) {
-    throw new Error(`${name} が未設定です。.env を確認してください。`)
+    throw new Error(`${name} が未設定です。.env または GitHub Secrets を確認してください。`)
   }
   return value
 }
@@ -41,6 +42,10 @@ function getRealmLabel() {
 
 function getStateVariableName() {
   return process.env.GH_MONITOR_STATE_VARIABLE_NAME || DEFAULT_STATE_VARIABLE_NAME
+}
+
+function getAuthCacheSecretName() {
+  return process.env.GH_AUTH_CACHE_SECRET_NAME || DEFAULT_AUTH_CACHE_SECRET_NAME
 }
 
 function parseRepoSlug(repoSlug) {
@@ -65,6 +70,7 @@ function buildGitHubApiHeaders(token) {
 
 async function githubApi(pathname, init = {}) {
   const token = requiredEnv('GH_INTERNAL_AUTOMATION_TOKEN')
+
   const res = await fetch(`https://api.github.com${pathname}`, {
     ...init,
     headers: {
@@ -72,6 +78,7 @@ async function githubApi(pathname, init = {}) {
       ...(init.headers || {}),
     },
   })
+
   return res
 }
 
@@ -116,7 +123,6 @@ async function writeStateToRepoVariable(state) {
   const variableName = getStateVariableName()
   const value = JSON.stringify(state)
 
-  // まず update を試す
   const patchRes = await githubApi(
     `/repos/${owner}/${repo}/actions/variables/${encodeURIComponent(variableName)}`,
     {
@@ -130,18 +136,14 @@ async function writeStateToRepoVariable(state) {
   )
 
   if (patchRes.status === 404) {
-    // 無ければ create
-    const postRes = await githubApi(
-      `/repos/${owner}/${repo}/actions/variables`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: variableName,
-          value,
-        }),
-      }
-    )
+    const postRes = await githubApi(`/repos/${owner}/${repo}/actions/variables`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: variableName,
+        value,
+      }),
+    })
 
     if (!postRes.ok) {
       const text = await postRes.text()
@@ -333,14 +335,13 @@ async function bundleAuthCacheDir(cacheDir) {
 }
 
 async function updateGitHubAuthCacheSecretIfConfigured() {
-  const repo = process.env.GH_REPO
-  const token = process.env.GH_SECRETS_WRITE_TOKEN
-  const secretName =
-    process.env.GH_AUTH_CACHE_SECRET_NAME || 'PRISMARINE_AUTH_CACHE_BUNDLE'
-
-  if (!repo || !token) {
+  if (!process.env.GH_REPO || !process.env.GH_INTERNAL_AUTOMATION_TOKEN) {
     return false
   }
+
+  const repo = requiredEnv('GH_REPO')
+  const token = requiredEnv('GH_INTERNAL_AUTOMATION_TOKEN')
+  const secretName = getAuthCacheSecretName()
 
   const bundle = await bundleAuthCacheDir(AUTH_CACHE_DIR)
   if (!bundle) {
@@ -350,10 +351,7 @@ async function updateGitHubAuthCacheSecretIfConfigured() {
   const sodium = require('libsodium-wrappers')
   await sodium.ready
 
-  const [owner, repoName] = repo.split('/')
-  if (!owner || !repoName) {
-    throw new Error(`GH_REPO="${repo}" の形式が不正です。owner/repo 形式で指定してください。`)
-  }
+  const { owner, repo: repoName } = parseRepoSlug(repo)
 
   const headers = {
     Accept: 'application/vnd.github+json',
@@ -581,8 +579,8 @@ async function main() {
     await writeState({
       previousCount: currentCount,
       authPaused: false,
-      authFailedAt: previousState.authFailedAt ?? null,
-      authRecoveredAt: previousState.authRecoveredAt ?? null,
+      authFailedAt: previousState?.authFailedAt ?? null,
+      authRecoveredAt: previousState?.authRecoveredAt ?? null,
       updatedAt: new Date().toISOString(),
     })
 
