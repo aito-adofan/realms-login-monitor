@@ -10,6 +10,7 @@ const AUTH_CACHE_DIR = path.join(__dirname, 'auth-cache')
 
 const DEFAULT_MONITOR_TIMEOUT_MS = 15_000
 const DEFAULT_RECOVERY_TIMEOUT_MS = 300_000
+const DEFAULT_STATE_VARIABLE_NAME = 'MONITOR_STATE'
 
 class AuthNeedsRefreshError extends Error {
   constructor(message = 'auth-cache の再生成が必要です。', details = {}) {
@@ -38,7 +39,43 @@ function getRealmLabel() {
   return `Realm ${requiredEnv('REALM_ID')}`
 }
 
-async function readState() {
+function getStateVariableName() {
+  return process.env.GH_MONITOR_STATE_VARIABLE_NAME || DEFAULT_STATE_VARIABLE_NAME
+}
+
+function parseRepoSlug(repoSlug) {
+  const [owner, repo] = String(repoSlug || '').split('/')
+  if (!owner || !repo) {
+    throw new Error(`GH_REPO="${repoSlug}" の形式が不正です。owner/repo 形式で指定してください。`)
+  }
+  return { owner, repo }
+}
+
+function shouldUseRepoVariableState() {
+  return !!process.env.GH_REPO && !!process.env.GH_INTERNAL_AUTOMATION_TOKEN
+}
+
+function buildGitHubApiHeaders(token) {
+  return {
+    Accept: 'application/vnd.github+json',
+    Authorization: `Bearer ${token}`,
+    'X-GitHub-Api-Version': '2026-03-10',
+  }
+}
+
+async function githubApi(pathname, init = {}) {
+  const token = requiredEnv('GH_INTERNAL_AUTOMATION_TOKEN')
+  const res = await fetch(`https://api.github.com${pathname}`, {
+    ...init,
+    headers: {
+      ...buildGitHubApiHeaders(token),
+      ...(init.headers || {}),
+    },
+  })
+  return res
+}
+
+async function readStateFromFile() {
   try {
     const raw = await fs.readFile(STATE_PATH, 'utf8')
     return JSON.parse(raw)
@@ -48,8 +85,90 @@ async function readState() {
   }
 }
 
-async function writeState(state) {
+async function writeStateToFile(state) {
   await fs.writeFile(STATE_PATH, JSON.stringify(state, null, 2), 'utf8')
+}
+
+async function readStateFromRepoVariable() {
+  const { owner, repo } = parseRepoSlug(requiredEnv('GH_REPO'))
+  const variableName = getStateVariableName()
+
+  const res = await githubApi(
+    `/repos/${owner}/${repo}/actions/variables/${encodeURIComponent(variableName)}`,
+    { method: 'GET' }
+  )
+
+  if (res.status === 404) {
+    return null
+  }
+
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`Repository Variable 読み込み失敗: ${res.status} ${text}`)
+  }
+
+  const json = await res.json()
+  return JSON.parse(json.value)
+}
+
+async function writeStateToRepoVariable(state) {
+  const { owner, repo } = parseRepoSlug(requiredEnv('GH_REPO'))
+  const variableName = getStateVariableName()
+  const value = JSON.stringify(state)
+
+  // まず update を試す
+  const patchRes = await githubApi(
+    `/repos/${owner}/${repo}/actions/variables/${encodeURIComponent(variableName)}`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: variableName,
+        value,
+      }),
+    }
+  )
+
+  if (patchRes.status === 404) {
+    // 無ければ create
+    const postRes = await githubApi(
+      `/repos/${owner}/${repo}/actions/variables`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: variableName,
+          value,
+        }),
+      }
+    )
+
+    if (!postRes.ok) {
+      const text = await postRes.text()
+      throw new Error(`Repository Variable 作成失敗: ${postRes.status} ${text}`)
+    }
+
+    return
+  }
+
+  if (!patchRes.ok) {
+    const text = await patchRes.text()
+    throw new Error(`Repository Variable 更新失敗: ${patchRes.status} ${text}`)
+  }
+}
+
+async function readState() {
+  if (shouldUseRepoVariableState()) {
+    return readStateFromRepoVariable()
+  }
+  return readStateFromFile()
+}
+
+async function writeState(state) {
+  if (shouldUseRepoVariableState()) {
+    return writeStateToRepoVariable(state)
+  }
+  return writeStateToFile(state)
 }
 
 async function withTimeout(promise, ms, label = '処理') {
@@ -305,16 +424,12 @@ async function attemptMonitoring({ state }) {
   const timeoutMs = pausedAlready ? recoveryTimeoutMs : monitorTimeoutMs
 
   let interactiveAuthRequested = false
-  let lastCodeInfo = null
   let challengeNotificationPromise = null
 
   const realmLabel = getRealmLabel()
 
-  // 通常モードでも callback を付けてコンソール出力を抑止
-  // ただし通常モードでは Discord へコード送信しない
   const codeCallback = (codeInfo) => {
     interactiveAuthRequested = true
-    lastCodeInfo = codeInfo
 
     if (pausedAlready && !challengeNotificationPromise) {
       challengeNotificationPromise = sendDiscordNotification(
@@ -340,10 +455,6 @@ async function attemptMonitoring({ state }) {
 
   const api = RealmAPI.from(authflow, 'bedrock')
 
-  // 通常モード:
-  // device code callback が呼ばれたら即 auth エラー扱い
-  // 復旧モード:
-  // 5分待って認証完了を待つ
   const realmsPromise = api.getRealms()
   const realms = await withTimeout(
     Promise.race([
@@ -396,7 +507,6 @@ async function main() {
     const { targetRealm, result, interactiveAuthRequested, pausedAlready } =
       await attemptMonitoring({ state: previousState })
 
-    // authPaused=true の復旧モードで成功した場合
     if (pausedAlready) {
       let secretsUpdated = false
 
@@ -427,13 +537,11 @@ async function main() {
       )
 
       console.log('[INFO] 認証が復旧したため、通常監視を再開します。')
-      console.log('[INFO] state.json を更新しました。')
       process.exit(0)
     }
 
-    // 初回実行
     if (!previousState) {
-      console.log('[INFO] state.json が無いため初回実行とみなし、保存のみ行います。')
+      console.log('[INFO] 初回状態が無いため、保存のみ行います。')
       await writeState({
         previousCount: result.count,
         authPaused: false,
@@ -478,10 +586,9 @@ async function main() {
       updatedAt: new Date().toISOString(),
     })
 
-    console.log('[INFO] state.json を更新しました。')
+    console.log('[INFO] state を更新しました。')
     process.exit(0)
   } catch (err) {
-    // 通常モードで auth-cache がダメなとき
     if (!previousState?.authPaused && err instanceof AuthNeedsRefreshError) {
       await sendDiscordNotification(
         adminWebhookUrl,
@@ -502,7 +609,6 @@ async function main() {
       process.exit(0)
     }
 
-    // authPaused=true の復旧モードで今回の待機中に認証完了しなかった
     if (previousState?.authPaused) {
       console.log(
         '[INFO] authPaused=true のため、今回の復旧待機時間内では認証完了しませんでした。'
